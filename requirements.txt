@@ -1,0 +1,5 @@
+numpy
+Pillow
+tensorflow-datasets
+tkinterdnd2
+tensorflow
