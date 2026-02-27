@@ -1,9 +1,10 @@
 import os
 import io
 import threading
+import re
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from collections import Counter
+from collections import Counter, OrderedDict
 from contextlib import redirect_stderr, redirect_stdout
 
 import numpy as np
@@ -76,14 +77,25 @@ class RldsViewerApp:
         self.dataset_dir = None
         self.episodes = []
         self.current_episode = None
+        self.current_episode_index = None
         self.current_step = 0
         self.playing = False
         self.play_job = None
         self.max_episodes = 200
+        self.episode_cache_size = 8
         self.exec_globals = {}
+        self.image_paths = []
+        self.ds = None
+        self.dataset_name = ""
+        self.visible_episode_count = 0
+        self.total_episode_count = None
+        self.load_request_token = 0
+        self.episode_cache = OrderedDict()
+        self.cache_lock = threading.Lock()
 
         self._build_ui()
         self._init_exec_env()
+        self._add_image_path("observation.image")
 
     def _build_ui(self):
         top = ttk.Frame(self.root, padding=8)
@@ -118,8 +130,27 @@ class RldsViewerApp:
         right = ttk.Frame(main)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
-        self.image_label = ttk.Label(right)
-        self.image_label.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        image_path_panel = ttk.LabelFrame(right, text="Image Paths", padding=8)
+        image_path_panel.pack(side=tk.TOP, fill=tk.X)
+
+        path_controls = ttk.Frame(image_path_panel)
+        path_controls.pack(side=tk.TOP, fill=tk.X)
+        self.image_path_var = tk.StringVar(value="observation.image")
+        self.image_path_entry = ttk.Entry(path_controls, textvariable=self.image_path_var)
+        self.image_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.image_path_entry.bind("<Return>", lambda _event: self._add_image_path_from_entry())
+        ttk.Button(path_controls, text="Add", command=self._add_image_path_from_entry).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Button(path_controls, text="Remove", command=self._remove_selected_image_path).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+
+        self.image_path_list = tk.Listbox(image_path_panel, height=3)
+        self.image_path_list.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+
+        self.image_row = ttk.Frame(right)
+        self.image_row.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(8, 0))
 
         controls = ttk.Frame(right, padding=(0, 8, 0, 0))
         controls.pack(side=tk.TOP, fill=tk.X)
@@ -195,6 +226,140 @@ class RldsViewerApp:
         self.code_output_text.delete("1.0", tk.END)
         self.code_output_text.insert(tk.END, text)
         self.code_output_text.configure(state=tk.DISABLED)
+
+    def _next_request_token(self):
+        self.load_request_token += 1
+        return self.load_request_token
+
+    def _set_image_message(self, message):
+        for child in self.image_row.winfo_children():
+            child.destroy()
+        ttk.Label(self.image_row, text=message).pack(side=tk.LEFT, padx=8, pady=8)
+
+    def _get_split_episode_count(self, builder, split_name):
+        split_info = builder.info.splits.get(split_name)
+        if split_info is None:
+            return None
+        count = split_info.num_examples
+        if isinstance(count, int) and count >= 0:
+            return count
+        return None
+
+    def _get_cached_episode(self, index):
+        with self.cache_lock:
+            episode = self.episode_cache.get(index)
+            if episode is None:
+                return None
+            self.episode_cache.move_to_end(index)
+            return episode
+
+    def _put_cached_episode(self, index, episode):
+        with self.cache_lock:
+            self.episode_cache[index] = episode
+            self.episode_cache.move_to_end(index)
+            while len(self.episode_cache) > self.episode_cache_size:
+                self.episode_cache.popitem(last=False)
+
+    def _fetch_episode_from_dataset(self, index):
+        if self.ds is None:
+            raise RuntimeError("Dataset is not initialized.")
+        one = self.ds.skip(index).take(1)
+        for episode in tfds.as_numpy(one):
+            steps = list(episode["steps"])
+            out = dict(episode)
+            out["steps"] = steps
+            return out
+        return None
+
+    def _prefetch_episode(self, index):
+        if index < 0 or index >= self.visible_episode_count:
+            return
+        if self._get_cached_episode(index) is not None:
+            return
+        try:
+            episode = self._fetch_episode_from_dataset(index)
+            if episode is not None:
+                self._put_cached_episode(index, episode)
+        except Exception:
+            return
+
+    def _refresh_image_path_list(self):
+        self.image_path_list.delete(0, tk.END)
+        for path in self.image_paths:
+            self.image_path_list.insert(tk.END, path)
+
+    def _add_image_path(self, path):
+        path = path.strip()
+        if not path:
+            return
+        if path in self.image_paths:
+            return
+        self.image_paths.append(path)
+        self._refresh_image_path_list()
+        if self.current_episode is not None:
+            self._render_step()
+
+    def _add_image_path_from_entry(self):
+        self._add_image_path(self.image_path_var.get())
+
+    def _remove_selected_image_path(self):
+        selected = self.image_path_list.curselection()
+        if not selected:
+            return
+        idx = selected[0]
+        if idx < 0 or idx >= len(self.image_paths):
+            return
+        self.image_paths.pop(idx)
+        self._refresh_image_path_list()
+        if self.current_episode is not None:
+            self._render_step()
+
+    def _parse_data_path(self, path):
+        tokens = []
+        for chunk in path.split("."):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            match = re.match(r"^[^\[\]]+", chunk)
+            if match:
+                tokens.append(match.group(0))
+            for index_match in re.finditer(r"\[(\d+)\]", chunk):
+                tokens.append(int(index_match.group(1)))
+        return tokens
+
+    def _get_value_by_path(self, value, path):
+        current = value
+        for token in self._parse_data_path(path):
+            if isinstance(token, int):
+                try:
+                    current = current[token]
+                except Exception:
+                    return None
+            else:
+                if not isinstance(current, dict) or token not in current:
+                    return None
+                current = current[token]
+            if current is None:
+                return None
+        return current
+
+    def _to_pil_image(self, value):
+        if isinstance(value, Image.Image):
+            return value.copy()
+        if not isinstance(value, np.ndarray):
+            return None
+        array = value
+        if array.dtype in (np.float16, np.float32, np.float64):
+            max_value = float(np.nanmax(array)) if array.size else 0.0
+            if max_value <= 1.0:
+                array = np.clip(array, 0.0, 1.0) * 255.0
+            array = np.clip(array, 0.0, 255.0).astype(np.uint8)
+        elif array.dtype != np.uint8:
+            array = np.clip(array, 0, 255).astype(np.uint8)
+        try:
+            return Image.fromarray(array)
+        except Exception:
+            return None
 
     def _init_exec_env(self):
         self.exec_globals = {
@@ -298,12 +463,23 @@ class RldsViewerApp:
             return
 
         self.dataset_dir = dataset_dir
+        self._next_request_token()
         self.path_var.set(f"Loading: {dataset_dir}")
         self.episode_list.delete(0, tk.END)
+        self.ds = None
+        self.dataset_name = ""
         self.episodes = []
+        self.visible_episode_count = 0
+        self.total_episode_count = None
+        self.episode_cache = OrderedDict()
         self.current_episode = None
+        self.current_episode_index = None
         self.current_step = 0
+        self.step_scale.configure(to=0)
+        self.step_var.set(0)
+        self.step_label_var.set("Step 0/0")
         self._set_info("")
+        self._set_image_message("Loading dataset...")
         self._refresh_exec_context()
 
         thread = threading.Thread(target=self._load_worker, daemon=True)
@@ -313,27 +489,39 @@ class RldsViewerApp:
         try:
             builder = tfds.builder_from_directory(self.dataset_dir)
             ds = builder.as_dataset(split="train")
-            episodes = []
-            for idx, episode in enumerate(tfds.as_numpy(ds)):
-                steps = list(episode["steps"])
-                episode = dict(episode)
-                episode["steps"] = steps
-                episodes.append(episode)
-                if idx + 1 >= self.max_episodes:
-                    break
-            self.episodes = episodes
-            self.root.after(0, self._on_dataset_loaded, builder.name)
+            total_count = self._get_split_episode_count(builder, "train")
+            if total_count is None:
+                visible_count = self.max_episodes
+            else:
+                visible_count = min(total_count, self.max_episodes)
+            self.root.after(0, self._on_dataset_loaded, builder.name, ds, total_count, visible_count)
         except Exception as exc:
             self.root.after(0, self._on_dataset_error, exc)
 
-    def _on_dataset_loaded(self, name):
-        self.path_var.set(f"Loaded {name} from {self.dataset_dir} ({len(self.episodes)} episodes)")
-        for idx in range(len(self.episodes)):
+    def _on_dataset_loaded(self, name, ds, total_count, visible_count):
+        self.dataset_name = name
+        self.ds = ds
+        self.total_episode_count = total_count
+        self.visible_episode_count = visible_count
+        self.episodes = [{"index": idx} for idx in range(visible_count)]
+
+        if total_count is None:
+            self.path_var.set(
+                f"Loaded {name} from {self.dataset_dir} (showing up to {visible_count} episodes, lazy load)"
+            )
+        else:
+            self.path_var.set(
+                f"Loaded {name} from {self.dataset_dir} (showing {visible_count}/{total_count} episodes, lazy load)"
+            )
+
+        for idx in range(visible_count):
             self.episode_list.insert(tk.END, f"Episode {idx:04d}")
         self._refresh_exec_context()
-        if self.episodes:
+        if visible_count > 0:
             self.episode_list.selection_set(0)
-            self._load_episode(0)
+            self._request_episode_load(0)
+        else:
+            self._set_image_message("No episodes available.")
 
     def _on_dataset_error(self, exc):
         messagebox.showerror("Load failed", str(exc))
@@ -343,18 +531,64 @@ class RldsViewerApp:
         sel = self.episode_list.curselection()
         if not sel:
             return
-        self._load_episode(sel[0])
+        self._request_episode_load(sel[0])
 
-    def _load_episode(self, index):
-        if index < 0 or index >= len(self.episodes):
+    def _request_episode_load(self, index):
+        if index < 0 or index >= self.visible_episode_count:
             return
-        self.current_episode = self.episodes[index]
-        steps = self.current_episode["steps"]
+        self.current_episode = None
+        self.current_episode_index = index
+        self.current_step = 0
+        self.step_scale.configure(to=0)
+        self.step_var.set(0)
+        self.step_label_var.set("Loading...")
+        self._set_info("")
+        self._set_image_message(f"Loading Episode {index:04d}...")
+        self.path_var.set(f"Loading episode {index:04d}...")
+        self._refresh_exec_context()
+
+        token = self._next_request_token()
+        thread = threading.Thread(target=self._load_episode_worker, args=(index, token), daemon=True)
+        thread.start()
+
+    def _load_episode_worker(self, index, token):
+        try:
+            episode = self._get_cached_episode(index)
+            if episode is None:
+                episode = self._fetch_episode_from_dataset(index)
+                if episode is not None:
+                    self._put_cached_episode(index, episode)
+            self.root.after(0, self._on_episode_loaded, index, token, episode, None)
+        except Exception as exc:
+            self.root.after(0, self._on_episode_loaded, index, token, None, exc)
+
+    def _on_episode_loaded(self, index, token, episode, error):
+        if token != self.load_request_token:
+            return
+        if error is not None:
+            self._on_dataset_error(error)
+            return
+        if episode is None:
+            self.path_var.set(f"Episode {index:04d} not available.")
+            self._set_image_message("Episode not available.")
+            self.step_label_var.set("Step 0/0")
+            return
+
+        self.current_episode = episode
+        self.current_episode_index = index
+        steps = self.current_episode.get("steps", [])
         self.current_step = 0
         self.step_scale.configure(to=max(len(steps) - 1, 0))
         self.step_var.set(0)
+        self.path_var.set(
+            f"Loaded {self.dataset_name} from {self.dataset_dir} - Episode {index:04d} ({len(steps)} steps)"
+        )
         self._render_step()
         self._refresh_exec_context()
+
+        prefetch_index = index + 1
+        if prefetch_index < self.visible_episode_count:
+            threading.Thread(target=self._prefetch_episode, args=(prefetch_index,), daemon=True).start()
 
     def _on_step_change(self, _value):
         if self.current_episode is None:
@@ -370,17 +604,41 @@ class RldsViewerApp:
         if not steps:
             return
         step = steps[self.current_step]
-        image = step["observation"]["image"]
-        if image is not None:
-            pil_img = Image.fromarray(image)
-            max_w, max_h = 900, 500
+        for child in self.image_row.winfo_children():
+            child.destroy()
+
+        available_w = max(self.image_row.winfo_width(), 900)
+        num_images = max(len(self.image_paths), 1)
+        max_w = max(180, min(420, available_w // num_images - 12))
+        max_h = 500
+
+        has_any_image = False
+        for image_path in self.image_paths:
+            raw_value = self._get_value_by_path(step, image_path)
+            pil_img = self._to_pil_image(raw_value)
+
+            slot = ttk.Frame(self.image_row)
+            slot.pack(side=tk.LEFT, fill=tk.Y, padx=4)
+            ttk.Label(slot, text=image_path, anchor="center").pack(side=tk.TOP, fill=tk.X)
+
+            if pil_img is None:
+                ttk.Label(slot, text="No image").pack(side=tk.TOP, pady=(8, 0))
+                continue
+
             scale = min(max_w / pil_img.width, max_h / pil_img.height, 1.0)
             if scale < 1.0:
                 new_size = (int(pil_img.width * scale), int(pil_img.height * scale))
                 pil_img = pil_img.resize(new_size, Image.BILINEAR)
             tk_img = ImageTk.PhotoImage(pil_img)
-            self.image_label.configure(image=tk_img)
-            self.image_label.image = tk_img
+            image_label = ttk.Label(slot, image=tk_img)
+            image_label.image = tk_img
+            image_label.pack(side=tk.TOP, pady=(6, 0))
+            has_any_image = True
+
+        if not has_any_image and not self.image_paths:
+            ttk.Label(self.image_row, text="Add at least one image path.").pack(
+                side=tk.LEFT, padx=8, pady=8
+            )
 
         action = step.get("action")
         state = step.get("observation", {}).get("state")
