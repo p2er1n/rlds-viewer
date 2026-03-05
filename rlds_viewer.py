@@ -357,7 +357,7 @@ class RldsViewerApp:
         elif array.dtype != np.uint8:
             array = np.clip(array, 0, 255).astype(np.uint8)
         try:
-            return Image.fromarray(array)
+            return Image.fromarray(array, mode="RGB")
         except Exception:
             return None
 
